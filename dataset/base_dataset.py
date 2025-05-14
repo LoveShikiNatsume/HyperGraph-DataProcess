@@ -31,6 +31,21 @@ class BaseDataset:
         self.__config__ = config
         U.check(self.__data_path__)
 
+    # 新增方法：设置服务特定的数据目录和保存目录
+    def set_service_paths(self, service_data_dir, service_save_dir):
+        """为特定服务设置数据目录和保存目录，不修改原始配置"""
+        self.service_data_dir = service_data_dir
+        self.service_save_dir = service_save_dir
+        self.__data_path__ = os.path.join(
+            service_save_dir, f"{self.dataset}_{self.__class__.__name__.lower().replace('dataset', '')}_tmp.json"
+        )
+        U.check(self.__data_path__)
+
+    # 获取实际使用的数据目录
+    def get_data_dir(self):
+        """返回当前使用的数据目录，优先使用服务特定的目录"""
+        return getattr(self, 'service_data_dir', self.dataset_dir)
+
     @property
     def X(self):
         return self.__X__
@@ -80,19 +95,18 @@ class BaseDataset:
         """
         raise NotImplementedError
 
-    def __get_files__(self, root: str, keyword: str):
-        r"""
-        :root: 搜索的根目录
-        :keyword：文件含有的关键词
-        :return 含有关键字的文件列表['file1', 'file2']
-        """
-        # print(root)
-        # print(keyword)
+    def __get_files__(self, root: str, keywords):
+        # 使用实际的数据目录，优先使用服务特定的目录
+        actual_root = self.get_data_dir() if root == self.dataset_dir else root
+
+        # 如果 keywords 是字符串，将其转换为列表
+        if isinstance(keywords, str):
+            keywords = [keywords]
+
         files = []
-        for dirpath, _, filenames in os.walk(root):
+        for dirpath, _, filenames in os.walk(actual_root):
             for filename in filenames:
-                if filename.find(keyword) != -1:
-                    # print(os.path.join(dirpath, filename))
+                if any(keyword in filename for keyword in keywords):
                     files.append(os.path.join(dirpath, filename))
 
         return files

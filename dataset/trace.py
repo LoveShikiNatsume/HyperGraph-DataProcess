@@ -9,11 +9,16 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
-class TraceDataset(BaseDataset):
-    def __init__(self, config):
+class UnifiedTraceDataset(BaseDataset):
+    def __init__(self, config) -> None:
         super().__init__(config, "trace")
         self.time_window = 60  # 时间窗口大小(秒)
         self.sequence_length = 10  # 序列长度，即每个特征向量包含多少个时间窗口
+
+        # 从配置中加载数据集特定参数
+        self.dates = config.get("dates", [])
+        self.anomaly_dict = config.get("anomaly_dict", {})
+        self.file_patterns = config.get("file_patterns", {})
 
     def z_score_normalize(self, X):
         """
@@ -69,6 +74,85 @@ class TraceDataset(BaseDataset):
             duration_series = duration_series[-self.sequence_length:]
 
         return duration_series
+
+    def __load_groundtruth_df__(self, file_list):
+        """处理groundtruth数据，统一输出格式"""
+        if not file_list:
+            return None
+        
+        # 读取文件，是否为JSON格式根据数据集决定
+        groundtruth_df = self.__load_df__(file_list, is_json=self.dataset == "aiops22")
+        
+        # 标准化列名
+        if "anomaly_type" in groundtruth_df.columns:
+            groundtruth_df = groundtruth_df.rename(columns={"anomaly_type": "failure_type"})
+        if "instance" in groundtruth_df.columns:
+            groundtruth_df = groundtruth_df.rename(columns={"instance": "root_cause"})
+        if "cmdb_id" in groundtruth_df.columns and "root_cause" not in groundtruth_df.columns:
+            groundtruth_df = groundtruth_df.rename(columns={"cmdb_id": "root_cause"})
+                
+        # 处理时间字段
+        if "st_time" in groundtruth_df.columns and isinstance(groundtruth_df["st_time"].iloc[0], str):
+            groundtruth_df["st_time"] = groundtruth_df["st_time"].apply(
+                lambda x: datetime.strptime(x.split(".")[0], "%Y-%m-%d %H:%M:%S").timestamp()
+            )
+            
+        # 如果有ed_time列且为字符串格式，转换为时间戳
+        if "ed_time" in groundtruth_df.columns and isinstance(groundtruth_df["ed_time"].iloc[0], str):
+            groundtruth_df["ed_time"] = groundtruth_df["ed_time"].apply(
+                lambda x: datetime.strptime(x.split(".")[0], "%Y-%m-%d %H:%M:%S").timestamp()
+            )
+        
+        # 设置时间窗口
+        duration = 600
+        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
+        
+        # 故障类型映射
+        if "failure_type" in groundtruth_df.columns and self.anomaly_dict:
+            groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
+                lambda x: self.anomaly_dict.get(x, x)
+            )
+        
+        return groundtruth_df
+
+    def __load_trace_df__(self, file_list):
+        """处理调用链数据，统一输出格式"""
+        if not file_list:
+            return None
+        
+        trace_df = self.__load_df__(file_list)
+        
+        # 标准化时间戳
+        if "timestamp" in trace_df.columns:
+            # 确保为10位整数时间戳
+            trace_df["timestamp"] = trace_df["timestamp"].apply(
+                lambda x: int(x/1000) if len(str(int(x))) > 10 else int(x)
+            )
+        
+        # 处理特定字段
+        if "parent_span" in trace_df.columns:
+            trace_df = trace_df.rename(columns={"parent_span": "parent_id"})
+            
+            # 父子拼接
+            if "parent_id" in trace_df.columns and "span_id" in trace_df.columns:
+                meta_df = trace_df[["parent_id", "cmdb_id"]].rename(
+                    columns={"parent_id": "span_id", "cmdb_id": "ccmdb_id"}
+                )
+                trace_df = pd.merge(trace_df, meta_df, on="span_id")
+                
+                # 添加调用链关系
+                if "cmdb_id" in trace_df.columns and "ccmdb_id" in trace_df.columns:
+                    trace_df["invoke_link"] = trace_df["cmdb_id"] + "_" + trace_df["ccmdb_id"]
+        
+        # 设置索引和排序
+        trace_df = trace_df.set_index("timestamp")
+        trace_df = trace_df.sort_index()
+        
+        # 计算持续时间
+        if "st_time" in trace_df.columns and "ed_time" in trace_df.columns:
+            trace_df["duration"] = trace_df["ed_time"] - trace_df["st_time"]
+        
+        return trace_df
 
     def __load__(self, traces, groundtruths):
         total = 0
@@ -147,212 +231,19 @@ class TraceDataset(BaseDataset):
     def get_feature(self):
         return self.sequence_length if self.__X__ else 0
 
-class Aiops22Trace(TraceDataset):
-    def __init__(self, config):
-        super().__init__(config)
-        self.dates = [
-            "2022-05-01",
-            "2022-05-03",
-            "2022-05-05",
-            "2022-05-07",
-            "2022-05-09",
-        ]
-        self.ANOMALY_DICT = {
-            "k8s容器网络延迟": "network",
-            "k8s容器写io负载": "io",
-            "k8s容器读io负载": "io",
-            "k8s容器cpu负载": "cpu",
-            "k8s容器网络资源包重复发送": "network",
-            "k8s容器进程中止": "process",
-            "k8s容器网络丢包": "network",
-            "k8s容器内存负载": "memory",
-            "k8s容器网络资源包损坏": "network",
-        }
-
-    def __load_groundtruth_df__(self, file_list):
-        groundtruth_df = self.__load_df__(file_list, is_json=True)
-        groundtruth_df = groundtruth_df.query("level != 'node'")
-        groundtruth_df.loc[:, "cmdb_id"] = groundtruth_df["cmdb_id"].apply(
-            lambda x: re.sub(r"\d?-\d", "", x)
-        )
-        groundtruth_df = groundtruth_df.rename(columns={"timestamp": "st_time"})
-        duration = 600
-        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
-        groundtruth_df["st_time"] = groundtruth_df["st_time"] - duration
-        groundtruth_df = groundtruth_df.reset_index(drop=True)
-        groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
-            lambda x: self.ANOMALY_DICT[x]
-        )
-        return groundtruth_df
-
-    def __load_trace_df__(self, file_list):
-        # 读取 data
-        trace_df = self.__load_df__(file_list)
-
-        # 处理 span
-        trace_df["timestamp"] = trace_df["timestamp"].apply(lambda x: int(x / 1000))
-        trace_df = trace_df.rename(columns={"parent_span": "parent_id"})
-
-        # 父子拼接
-        meta_df = trace_df[["parent_id", "cmdb_id"]].rename(
-            columns={"parent_id": "span_id", "cmdb_id": "ccmdb_id"}
-        )
-        trace_df = pd.merge(trace_df, meta_df, on="span_id")
-
-        # 划分 span
-        trace_df = trace_df.set_index("timestamp")
-        trace_df = trace_df.sort_index()
-        trace_df["invoke_link"] = trace_df["cmdb_id"] + "_" + trace_df["ccmdb_id"]
-        return trace_df
-
     def load(self):
-        trace_files = self.__get_files__(self.dataset_dir, "trace_jaeger-span")
+        """统一加载不同数据集的调用链数据"""
+        # 获取文件匹配模式
+        trace_pattern = self.file_patterns.get("trace", "trace")
+        groundtruth_pattern = self.file_patterns.get("groundtruth", "groundtruth")
+
+        # 获取文件列表
+        trace_files = self.__get_files__(self.dataset_dir, trace_pattern)
+        groundtruth_files = self.__get_files__(self.dataset_dir, groundtruth_pattern)
+
+        # 按日期分组
         traces = self.__add_by_date__(trace_files, self.dates)
-        groundtruth_files = self.__get_files__(self.dataset_dir, "groundtruth-")
         groundtruths = self.__add_by_date__(groundtruth_files, self.dates)
 
-        self.__load__(traces, groundtruths)
-
-
-class PlatformTrace(TraceDataset):
-    def __init__(self, config):
-        super().__init__(config)
-        self.dates = [
-            # "2024-03-21",
-            "2024-03-22",
-            "2024-03-23",
-            "2024-03-24",
-        ]
-        self.ANOMALY_DICT = {
-            "cpu anomaly": "cpu",
-            "http/grpc request abscence": "http/grpc",
-            "http/grpc requestdelay": "http/grpc",
-            "memory overload": "memory",
-            "network delay": "network",
-            "network loss": "network",
-            "pod anomaly": "pod_failure",
-        }
-
-    def __load_groundtruth_df__(self, file_list):
-        groundtruth_df = self.__load_df__(file_list).rename(
-            columns={
-                "故障类型": "failure_type",
-                "对应服务": "cmdb_id",
-                "起始时间戳": "st_time",
-                "截止时间戳": "ed_time",
-                "持续时间": "duration",
-            }
-        )
-
-        def meta_transfer(item):
-            if item.find("(") != -1:
-                item = eval(item)
-                item = item[0]
-            return item
-
-        groundtruth_df.loc[:, "cmdb_id"] = groundtruth_df["cmdb_id"].apply(
-            meta_transfer
-        )
-        groundtruth_df = groundtruth_df.rename(columns={"cmdb_id": "root_cause"})
-        duration = 600
-        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
-        groundtruth_df["st_time"] = groundtruth_df["st_time"] - duration
-        groundtruth_df = groundtruth_df.reset_index(drop=True)
-        groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
-            lambda x: self.ANOMALY_DICT[x]
-        )
-        return groundtruth_df
-
-    def __load_trace_df__(self, file_list):
-        # 读取 data
-        trace_df = self.__load_df__(file_list)
-
-        # 处理 span
-        trace_df["timestamp"] = trace_df["timestamp"].apply(lambda x: int(x / 1e6))
-        trace_df = trace_df.rename(columns={"parent_span": "parent_id"})
-
-        # 父子拼接
-        meta_df = trace_df[["parent_id", "cmdb_id"]].rename(
-            columns={"parent_id": "span_id", "cmdb_id": "ccmdb_id"}
-        )
-        trace_df = pd.merge(trace_df, meta_df, on="span_id")
-
-        # 划分 span
-        trace_df = trace_df.set_index("timestamp")
-        trace_df = trace_df.sort_index()
-        trace_df["invoke_link"] = trace_df["cmdb_id"] + "_" + trace_df["ccmdb_id"]
-        return trace_df
-
-    def load(self):
-        trace_files = self.__get_files__(self.dataset_dir, "trace")
-        traces = self.__add_by_date__(trace_files, self.dates)
-        groundtruth_files = self.__get_files__(self.dataset_dir, "ground_truth")
-        groundtruths = self.__add_by_date__(groundtruth_files, self.dates)
-
-        self.__load__(traces, groundtruths)
-
-
-class GaiaTrace(TraceDataset):
-    def __init__(self, config):
-        super().__init__(config)
-        self.dates = ["2021-07-04", "2021-07-05", "2021-07-06", "2021-07-07", "2021-07-08", "2021-07-09", "2021-07-10", "2021-07-11", "2021-07-12", "2021-07-13", "2021-07-14", "2021-07-15", "2021-07-16", "2021-07-17", "2021-07-18",  "2021-07-20", "2021-07-21", "2021-07-22", "2021-07-23", "2021-07-24", "2021-07-25", "2021-07-26", "2021-07-27", "2021-07-28", "2021-07-29", "2021-07-30", "2021-07-31"]
-
-        self.ANOMALY_DICT = {
-            "[memory_anomalies]": "memory",
-            "[normal memory freed label]": "memory",
-            "[access permission denied exception]": "access",
-            "[login failure]": "login",
-            "[file moving program]": "file",
-        }
-
-    def __load_groundtruth_df__(self, file_list):
-        groundtruth_df = self.__load_df__(file_list).rename(
-            columns={
-                "anomaly_type": "failure_type",
-                "instance": "instance_name",
-            }
-        )
-
-        def meta_transfer(item):
-            if item.find("(") != -1:
-                item = eval(item)
-                item = item[0]
-            return item
-
-        groundtruth_df.loc[:, "instance_name"] = groundtruth_df["instance_name"].apply(meta_transfer)
-        groundtruth_df = groundtruth_df.rename(columns={"instance_name": "root_cause"})
-        duration = 600
-        groundtruth_df["st_time"] = groundtruth_df["st_time"].apply(
-            lambda x: datetime.strptime(
-                x.split(".")[0], "%Y-%m-%d %H:%M:%S"
-            ).timestamp()
-        )
-        groundtruth_df["ed_time"] = groundtruth_df["ed_time"].apply(
-            lambda x: datetime.strptime(
-                x.split(".")[0], "%Y-%m-%d %H:%M:%S"
-            ).timestamp()
-        )
-        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
-        groundtruth_df = groundtruth_df.reset_index(drop=True)
-        groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
-            lambda x: self.ANOMALY_DICT[x]
-        )
-        return groundtruth_df
-
-    def __load_trace_df__(self, file_list):
-        trace_df = self.__load_df__(file_list)
-
-        trace_df = trace_df.set_index("timestamp")
-        trace_df = trace_df.sort_index()
-
-        trace_df["duration"] = trace_df["ed_time"] - trace_df["st_time"]
-        return trace_df
-
-    def load(self):
-        trace_files = self.__get_files__(self.dataset_dir, "trace")
-        traces = self.__add_by_date__(trace_files, self.dates)
-
-        groundtruth_files = self.__get_files__(self.dataset_dir, "groundtruth")
-        groundtruths = self.__add_by_date__(groundtruth_files, self.dates)
-
+        # 处理数据
         self.__load__(traces, groundtruths)

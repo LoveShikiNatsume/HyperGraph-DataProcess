@@ -13,6 +13,7 @@ import re
 import numpy as np
 from typing import Any
 import random
+from datetime import datetime
 
 class BertEncoder:
     def __init__(self, config) -> None:
@@ -62,16 +63,17 @@ class DrainProcesser:
         result = self._template_miner.add_log_message(line)
         return result["template_mined"]
 
-class LogDataset(BaseDataset):
+class UnifiedLogDataset(BaseDataset):
     def __init__(self, config) -> None:
-        #Drain、Bert工具初始化
-        r"""
-        X: [sample_num, seq, n_model]
-        """
         super().__init__(config, "log")
         self.sample_interval = self.__config__["sample_interval"]
         self._drain = DrainProcesser(config["drain_config"])
         self._encoder = BertEncoder(config["bert_config"])
+        
+        # 从配置中加载数据集特定参数
+        self.dates = config.get("dates", [])
+        self.anomaly_dict = config.get("anomaly_dict", {})
+        self.file_patterns = config.get("file_patterns", {})
 
     #处理一个故障注入记录，分为多个时间窗口，一个60秒，cnts表示时间窗口数量，用于评估日志模板权重
     def __add_sample__(self, st_time, cnts, log_df, label):
@@ -120,6 +122,13 @@ class LogDataset(BaseDataset):
         self.__y__["failure_type"].append(label["failure_type"])
         self.__y__["root_cause"].append(label["root_cause"])
 
+    def __add_zero_sample__(self, st_time, cnts, label):
+        """为没有日志数据的groundtruth添加全零特征向量"""
+        final_repr = np.zeros((768,))
+        self.__X__.append(final_repr.tolist())
+        self.__y__["failure_type"].append(label["failure_type"])
+        self.__y__["root_cause"].append(label["root_cause"])
+
     def __load__(self, log_df: pd.DataFrame, groundtruth_df: pd.DataFrame):
         r"""
         :log_df       : [timestamp, message]
@@ -163,236 +172,89 @@ class LogDataset(BaseDataset):
             process_bar.update(1)
         process_bar.close()
 
-class Aiops22Log(LogDataset):
-    def __init__(self, config: dict) -> None:
-        super().__init__(config)
-        self.ANOMALY_DICT = {
-            "k8s容器网络延迟": "network",
-            "k8s容器写io负载": "io",
-            "k8s容器读io负载": "io",
-            "k8s容器cpu负载": "cpu",
-            "k8s容器网络资源包重复发送": "network",
-            "k8s容器进程中止": "process",
-            "k8s容器网络丢包": "network",
-            "k8s容器内存负载": "memory",
-            "k8s容器网络资源包损坏": "network",
-        }
-
     def __load_groundtruth_df__(self, file_list):
-        groundtruth_df = self.__load_df__(file_list, is_json=True)
-        groundtruth_df = groundtruth_df.query("level != 'node'")
-        groundtruth_df.loc[:, "cmdb_id"] = groundtruth_df["cmdb_id"].apply(
-            lambda x: re.sub(r"\d?-\d", "", x)
-        )
-        groundtruth_df = groundtruth_df.rename(
-            columns={"timestamp": "st_time", "cmdb_id": "root_cause"}
-        )
-        duration = 600
-        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
-        groundtruth_df["st_time"] = groundtruth_df["st_time"] - duration
-        groundtruth_df = groundtruth_df.reset_index(drop=True)
-        groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
-            lambda x: self.ANOMALY_DICT[x]
-        )
-        return groundtruth_df.loc[
-            :, ["st_time", "ed_time", "failure_type", "root_cause"]
-        ]
-
-    def __load_log_df__(self, file_list):
-        # read log
-        log_df = self.__load_df__(file_list)
-        log_df = log_df.rename(columns={"value": "message"})
-        return log_df.loc[:, ["timestamp", "message"]]
-
-    def load(self):
-        # read groundtruth
-        groundtruth_files = self.__get_files__(self.dataset_dir, "groundtruth-")
-        log_files = self.__get_files__(self.dataset_dir, "-log-service")
-        dates = [
-            "2022-05-01",
-            "2022-05-03",
-            "2022-05-05",
-            "2022-05-07",
-            "2022-05-09",
-        ]
-        groundtruths = self.__add_by_date__(groundtruth_files, dates)
-        logs = self.__add_by_date__(log_files, dates)
-
-        for index, date in enumerate(dates):
-            U.notice(f"Loading... {date}")
-            groundtruth_df = self.__load_groundtruth_df__(groundtruths[index])
-            log_df = self.__load_log_df__(logs[index])
-            self.__load__(log_df, groundtruth_df)
-
-class PlatformLog(LogDataset):
-    def __init__(self, config) -> None:
-        super().__init__(config)
-        self.ANOMALY_DICT = {
-            "cpu anomaly": "cpu",
-            "http/grpc request abscence": "http/grpc",
-            "http/grpc requestdelay": "http/grpc",
-            "memory overload": "memory",
-            "network delay": "network",
-            "network loss": "network",
-            "pod anomaly": "pod_failure",
-        }
-
-    def __load_groundtruth_df__(self, file_list):
-        groundtruth_df = self.__load_df__(file_list).rename(
-            columns={
-                "故障类型": "failure_type",
-                "对应服务": "cmdb_id",
-                "起始时间戳": "st_time",
-                "截止时间戳": "ed_time",
-                "持续时间": "duration",
-            }
-        )
-
-        def meta_transfer(item):
-            if item.find("(") != -1:
-                item = eval(item)
-                item = item[0]
-            return item
-
-        groundtruth_df.loc[:, "cmdb_id"] = groundtruth_df["cmdb_id"].apply(
-            meta_transfer
-        )
-        groundtruth_df = groundtruth_df.rename(columns={"cmdb_id": "root_cause"})
-        duration = 600
-        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
-        groundtruth_df["st_time"] = groundtruth_df["st_time"] - duration
-        groundtruth_df = groundtruth_df.reset_index(drop=True)
-        groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
-            lambda x: self.ANOMALY_DICT[x]
-        )
-        return groundtruth_df.loc[
-            :, ["st_time", "ed_time", "failure_type", "root_cause"]
-        ]
-
-    def __load_log_df__(self, file_list):
-        # read log
-        log_df = self.__load_df__(file_list)
-        log_df.loc[:, "timestamp"] = log_df["timestamp"].apply(lambda x: int(x))
-        return log_df.loc[:, ["timestamp", "message"]]
-
-    def load(self):
-        groundtruth_files = self.__get_files__(self.dataset_dir, "ground_truth")
-        log_files = self.__get_files__(self.dataset_dir, "log")
-        dates = [
-            # "2024-03-20",
-            # "2024-03-21",
-            "2024-03-22",
-            "2024-03-23",
-            "2024-03-24",
-        ]
-        groundtruths = self.__add_by_date__(groundtruth_files, dates)
-        logs = self.__add_by_date__(log_files, dates)
-
-        for index, date in enumerate(dates):
-            U.notice(f"Loading... {date}")
-            groundtruth_df = self.__load_groundtruth_df__(groundtruths[index])
-            log_df = self.__load_log_df__(logs[index])
-            self.__load__(log_df, groundtruth_df)
-
-class GaiaLog(LogDataset):
-    def __init__(self, config) -> None:
-        super().__init__(config)
-        self.ANOMALY_DICT = {
-            "[memory_anomalies]": "memory",
-            "[normal memory freed label]": "memory",
-            "[access permission denied exception]": "access",
-            "[login failure]": "login",
-            "[file moving program]": "file",
-        }
-
-    def __load_groundtruth_df__(self, file_list):
-        r"""
-        输出:
-        groundtruth_df: 一个标准化后的 DataFrame，包含以下字段：
-            st_time: 异常起始时间戳（秒）。
-            ed_time: 异常结束时间戳（秒）。
-            failure_type: 异常类型，映射到统一类别。
-            root_cause: 异常根因服务实例。
-        """
-        #读取list中的所有csv文件内容，合并为一个DataFrame，并重命名列名
-        groundtruth_df = self.__load_df__(file_list).rename(
-            columns={
-                "anomaly_type": "failure_type",
-            }
-        )
-        groundtruth_df = groundtruth_df.rename(columns={"instance": "root_cause"})
-        duration = 600
-        from datetime import datetime
-
-        groundtruth_df["st_time"] = groundtruth_df["st_time"].apply(
-            lambda x: datetime.strptime(
-                x.split(".")[0], "%Y-%m-%d %H:%M:%S"
-            ).timestamp()
-        )
-        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
-        #不论是11s还是600s,统一时间窗口为600s
-        # groundtruth_df["st_time"] = groundtruth_df["st_time"] - duration
-        groundtruth_df = groundtruth_df.reset_index(drop=True)
-        groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
-            lambda x: self.ANOMALY_DICT[x]
-        )
-        return groundtruth_df.loc[
-            :, ["st_time", "ed_time", "failure_type", "root_cause"]
-        ]
-
-    def __load_log_df__(self, file_list):
-        from datetime import datetime
-
-        if not file_list:  # 如果没有日志文件
+        """处理groundtruth数据，统一输出格式"""
+        if not file_list:
             return None
+        
+        # 读取文件，是否为JSON格式根据数据集决定
+        groundtruth_df = self.__load_df__(file_list, is_json=self.dataset == "aiops22")
+        
+        # 标准化列名
+        if "anomaly_type" in groundtruth_df.columns:
+            groundtruth_df = groundtruth_df.rename(columns={"anomaly_type": "failure_type"})
+        if "instance" in groundtruth_df.columns:
+            groundtruth_df = groundtruth_df.rename(columns={"instance": "root_cause"})
+        if "cmdb_id" in groundtruth_df.columns and "root_cause" not in groundtruth_df.columns:
+            groundtruth_df = groundtruth_df.rename(columns={"cmdb_id": "root_cause"})
+                
+        # 处理时间字段
+        if "st_time" in groundtruth_df.columns and isinstance(groundtruth_df["st_time"].iloc[0], str):
+            groundtruth_df["st_time"] = groundtruth_df["st_time"].apply(
+                lambda x: datetime.strptime(x.split(".")[0], "%Y-%m-%d %H:%M:%S").timestamp()
+            )
+        
+        # 设置时间窗口
+        duration = 600
+        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
+        
+        # 故障类型映射
+        if "failure_type" in groundtruth_df.columns and self.anomaly_dict:
+            groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
+                lambda x: self.anomaly_dict.get(x, x)
+            )
+        
+        return groundtruth_df.loc[:, ["st_time", "ed_time", "failure_type", "root_cause"]]
 
+    def __load_log_df__(self, file_list):
+        """处理日志数据，统一输出格式"""
+        if not file_list:
+            return None
+        
         log_df = self.__load_df__(file_list)
-
-        def meta_ts(x):
-            try:
-                return datetime.strptime(
-                    x.split(",")[0], "%Y-%m-%d %H:%M:%S"
-                ).timestamp()
-            except:
-                return 0
-
-        log_df.loc[:, "timestamp"] = log_df["message"].apply(meta_ts)
-        log_df["message"] = log_df["message"].apply(
-            lambda x: "|".join(str(x).split("|")[1:])
-        )
-        log_df = log_df.rename(columns={"service": "cmdb_id"})
+        
+        # 标准化列名
+        if "value" in log_df.columns and "message" not in log_df.columns:
+            log_df = log_df.rename(columns={"value": "message"})
+        if "service" in log_df.columns and "cmdb_id" not in log_df.columns:
+            log_df = log_df.rename(columns={"service": "cmdb_id"})
+        
+        # 确保timestamp是整数类型
+        if "timestamp" in log_df.columns:
+            log_df["timestamp"] = log_df["timestamp"].astype(int)
+        
         return log_df.loc[:, ["timestamp", "message"]]
 
-    def __add_zero_sample__(self, st_time, cnts, label):
-        """为没有日志数据的groundtruth添加全零特征向量"""
-        final_repr = np.zeros((768,))
-        self.__X__.append(final_repr.tolist())
-        self.__y__["failure_type"].append(label["failure_type"])
-        self.__y__["root_cause"].append(label["root_cause"])
-
     def load(self):
-        groundtruth_files = self.__get_files__(self.dataset_dir, "groundtruth")
-        log_files = self.__get_files__(self.dataset_dir, "log")
-        dates = ["2021-07-04", "2021-07-05", "2021-07-06", "2021-07-07", "2021-07-08", "2021-07-09", "2021-07-10",
-                 "2021-07-11", "2021-07-12", "2021-07-13", "2021-07-14", "2021-07-15", "2021-07-16", "2021-07-17",
-                 "2021-07-18", "2021-07-20", "2021-07-21", "2021-07-22", "2021-07-23", "2021-07-24", "2021-07-25",
-                 "2021-07-26", "2021-07-27", "2021-07-28", "2021-07-29", "2021-07-30", "2021-07-31"]
-        groundtruths = self.__add_by_date__(groundtruth_files, dates)
-        logs = self.__add_by_date__(log_files, dates)
-
-        for index, date in enumerate(dates):
+        """统一加载不同数据集的日志数据"""
+        # 获取文件匹配模式
+        log_pattern = self.file_patterns.get("log", "log")
+        groundtruth_pattern = self.file_patterns.get("groundtruth", "groundtruth")
+        
+        # 获取文件列表
+        groundtruth_files = self.__get_files__(self.dataset_dir, groundtruth_pattern)
+        log_files = self.__get_files__(self.dataset_dir, log_pattern)
+        
+        # 按日期分组
+        groundtruths = self.__add_by_date__(groundtruth_files, self.dates)
+        logs = self.__add_by_date__(log_files, self.dates)
+        
+        # 逐日期处理数据
+        for index, date in enumerate(self.dates):
             U.notice(f"Loading... {date}")
-
+            
             # 加载 groundtruth_df
             if not groundtruths[index]:
                 U.notice(f"Skipping {date}: groundtruth_df is empty.")
                 continue
 
             groundtruth_df = self.__load_groundtruth_df__(groundtruths[index])
-
+            if groundtruth_df is None or groundtruth_df.empty:
+                continue
+                
             # 加载 log_df，如果没有日志文件，log_df 为 None
             log_df = self.__load_log_df__(logs[index]) if logs[index] else None
-
+            
             # 对于每条groundtruth记录
             for _, case in groundtruth_df.iterrows():
                 cnts = int((case["ed_time"] - case["st_time"]) / self.sample_interval)
@@ -404,10 +266,10 @@ class GaiaLog(LogDataset):
                 if log_df is not None:
                     # 如果有日志数据，正常处理
                     in_condition = log_df.loc[
-                                   (log_df["timestamp"] >= case["st_time"])
-                                   & (log_df["timestamp"] <= case["ed_time"]),
-                                   :,
-                                   ]
+                        (log_df["timestamp"] >= case["st_time"]) & 
+                        (log_df["timestamp"] <= case["ed_time"]),
+                        :,
+                    ]
                     self.__add_sample__(case["st_time"], cnts, in_condition, label)
                 else:
                     # 如果没有日志数据，添加全零特征向量

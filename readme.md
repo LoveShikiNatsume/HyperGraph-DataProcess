@@ -1,133 +1,275 @@
-# Medicine
+# HyperGraph-DataProcess
 
-## Giving Every Modality a Voice in Microservice Failure Diagnosis via Multimodal Adaptive Optimization
+一个用于处理多模态系统监控数据的特征提取和融合工具。本项目能够处理日志、指标和调用链数据，并将它们融合成统一的特征矩阵，为后续的故障诊断提供基础。
 
-The framework consists of three main stages: feature encoding, modality fusion, and optimization balancing. In the feature encoding stage, we design specific encoders for metrics, logs, and traces based on their characteristics. During the modality fusion stage, we use a fusion module with channel attention to combine the original statistical features and the failure classification features extracted by the encoders. In the optimization balancing stage, Medicine employs a modality evaluation component to identify high-yield and low-yield modalities, then uses a gradient suppression component to optimize high-yield modalities and a feature enhancement component to strengthen low-yield modalities.
+## 项目概述
 
-![The framework of Medicine](./assets/overview.png "The framework of Medicine")
+本项目设计用于处理分布式系统中的多模态数据，特别是:
 
-## Description
+- **指标数据(Metric)**: 系统和服务的性能指标，如CPU、内存使用率等
+- **日志数据(Log)**: 服务产生的文本日志记录
+- **调用链数据(Trace)**: 服务间调用关系和延迟数据
 
-### Folder Structure
+通过处理和融合这些数据，最终生成特征矩阵，可用于故障检测、定位和根因分析。
 
-#### Already Existing Folders
--   `./dataset`: it is used to preprocess and load data from specific path
--   `./models`: it stores models used in experiment
--   `./cache`: it stores the bert-base-uncased model used in experiment
+## 项目结构
 
-#### Auto Generated Folders
--   `./data`: it stores the intermediary files of each preprocessed dataset
--   `./result`: it stores the result of each experiment
+```
+HyperGraph-DataProcess/
+├── config.py                # 配置文件，包含各数据集的配置参数
+├── main.py                  # 核心处理逻辑，数据处理的主要入口
+├── process_all.py           # 批处理脚本，处理所有服务实例数据
+├── utils.py                 # 工具函数
+├── dataset/                 # 数据集处理类
+│   ├── __init__.py          # 导出数据集类
+│   ├── base_dataset.py      # 基础数据集类
+│   ├── log.py               # 日志数据处理类
+│   ├── metric.py            # 指标数据处理类
+│   ├── trace.py             # 调用链数据处理类
+│   └── drain3/              # 日志模板提取工具
+├── model/                   # 编码器和融合模型
+│   ├── encoder.py           # 各模态数据的编码器
+│   └── fusion.py            # 特征融合模型
+└── README.md                # 项目文档
+```
 
+## 数据流
 
-### File Description
+1. **原始数据** → 从各系统收集的原始监控数据
+2. **数据预处理** → 清洗、规范化和特征提取
+3. **模态编码** → 使用特定编码器处理不同模态数据
+4. **特征融合** → 将多模态特征融合为统一特征矩阵
+5. **输出结果** → 保存处理结果供下游任务使用
 
--   `config.py`：the config file of D1(AIops22) and D2(GAIA)
--   `main.py`：the entry file of experiment
--   `trainer.py`：the script file of traun and test model
--   `utils.py`：the utils file
+## 配置文件说明
 
-## Environment
+配置文件(`config.py`)中包含了针对不同数据集的详细配置，每个数据集配置包括:
 
--   Linux Server 20.04.1 LTS
--   Intel(R) Xeon(R) CPU E5-2650 v4@ 2.20GHz
--   Python version 3.9
+- **数据路径**: 数据目录、服务实例目录、保存目录等
+- **处理参数**: 采样间隔、时间窗口、工作线程数等
+- **数据集信息**: 服务列表、故障类型、日期范围等
+- **模型参数**: 编码器维度、注意力头数、层数等
 
-## Getting Started
+示例配置:
 
-> Recommend conda environment or venv
+```python
+gaia = {
+    "dataset": "gaia",
+    "dataset_dir": "../datasets/train-ticket",       # 指标数据的根目录
+    "service_dir": "../datasets/train-ticket/service", # 服务实例数据的根目录
+    "save_dir": "../datasets/processed",             # 处理后数据保存目录
+    # ... 更多配置参数 ...
+}
+```
 
-Run the following commands in turn at bash or shell
+## 使用方法
 
-1. `pip install -r requirements.txt`
-2. `python main.py --dataset gaia` or `python main.py --dataset aiops22`
+### 1. 使用批处理脚本处理所有服务数据
 
-All result will be saved in `result/`
+```bash
+python process_all.py --dataset <dataset_name> [--mode all|log|metric|trace]
+```
 
-## Reproduce
+参数说明:
+- `--dataset`: 要处理的数据集名称，必须是config.py中定义的数据集
+- `--mode`: 处理模式，默认为"all"(全部模态)，可选"log"(仅日志)、"metric"(仅指标)、"trace"(仅调用链)
 
-1. download gaia and aiops22 dataset we provide for you
-2. change dataset config in `./config.py` at the position described below:
-    ```python
-    gaia = {
-        "dataset_dir": "path to downloaded gaia dataset entry"
-    }
-    aiops22 = {
-        "dataset_dir": "path to downloaded aiops22 dataset entry"
-    }
-    ```
-3. remove `./data` folder
-4. run `python main.py --dataset gaia` or `python main.py --dataset aiops22`
+### 2. 直接使用main.py处理特定任务
 
-All result will be saved in `result/`
+```bash
+python main.py --dataset <dataset_name> --task <task_name> [--service <service_name>] [--discovered_services <service_list>]
+```
 
-## Some Issues
+参数说明:
+- `--dataset`: 要处理的数据集名称
+- `--task`: 任务类型，可选值:
+  - `process_metrics`: 处理指标数据并拆分到各服务目录
+  - `process_service`: 处理特定服务的日志和调用链数据
+  - `fusion`: 融合所有特征
+- `--service`: (仅与task=process_service一起使用)指定要处理的服务名称
+- `--discovered_services`: (仅与task=fusion一起使用)自动发现的服务实例列表
 
-### 1. Have some trouble with downloading `bert-base-uncased` by using transformers
+## 核心类和函数
 
-download pytorch version of `bert-base-uncased` from [huggingface](https://huggingface.co/google-bert/bert-base-uncased/tree/main)
+### 1. FeatureProcessor
 
-then copy them into `./cache/`
+`FeatureProcessor`类(main.py)是整个数据处理的核心，主要方法:
 
-# 只关注gaia相关的代码
-跑的时候用这个命令：`python main.py --dataset gaia`
-readme上面让装的依赖装一下，然后cache里面如果有bert的一堆东西就不用管，没有的话要在huggingface里下载，手动拉进来。
-## 1. 关于运行逻辑
-Medicine是一个先预处理数据后训练模型的框架，我们只用到Medicine的数据预处理部分，因此trainer.py中只关注MultiModalTrainer类中的__init__函数即可（我把train函数全部注释了），分别加载log、metric、trace，处理成特征向量。
+- `process_metrics()`: 处理指标数据并拆分到各服务目录
+- `process_service()`: 处理特定服务的日志和调用链数据
+- `merge_features()`: 合并所有模态的特征
+- `simple_concat_features()`: 简单拼接三种模态特征
+- `apply_feature_extraction()`: 使用编码器提取更高级特征
 
-我目前的方法是处理一个的时候，注释另外两个（这个也很丑陋，到时候可能要重新写个主函数来跑），代码会生成中间数据，就是特征向量。
-## 2. 关于文件路径（参见config.py）
-数据集存放路径是config.py中的dataset_dir；
+### 2. 数据集类
 
-生成的中间数据路径是config.py中的save_dir；
+所有数据集类都继承自`BaseDataset`(dataset/base_dataset.py):
 
-还有一个drain_save_path，是Medicine在处理Log时得到的中间drain.bin文件，这玩意儿不是特征向量；
-## 3. 关于特征向量处理的逻辑
-三种模态数据变成特征向量的处理逻辑分别在dataset/log.py、metric.py和trace.py中；
-这里有一个比较抽象的点，在于metric划分服务是在代码中就实现的，跑metric时可以直接读整个最大的数据集，这个就是完整的newgaia数据集，形式是：
-newgaia
-	2021-07-04
-	2021-07-05
+- `LogDataset`: 处理日志数据，使用Drain算法提取模板并使用BERT编码
+- `MetricDataset`: 处理指标数据，包括时间序列处理和特征提取
+- `TraceDataset`: 处理调用链数据，提取调用关系和延迟特征
 
-但是log、trace的划分服务不是在代码中，现在是在数据集中，所以要处理log，数据集的形式如下，这种形式的数据集我写脚本切分处理过了，要的话直接找我
-service
-	dbservice1
-		2021-07-04
-		2021-07-05
-	dbservice2
-		2021-07-04
-		2021-07-05
+新增的服务路径处理方法:
+- `set_service_paths()`: 为特定服务设置数据目录和保存目录
+- `get_data_dir()`: 返回当前使用的数据目录
 
-然后dataset_dir又要求目录下边必须直接是各个日期的文件夹，所以要想分服务跑log、trace的特征向量就必须一个服务改一遍dataset_dir、save_dir和drain_save_path，我目前用一种比较丑陋的方法，写了一个runbyservice脚本，自动改config里面的dataset_dir、save_dir以及drain_save_path（比如改成dbservice1的路径），然后脚本自动命令行启动。之后要发这个代码肯定得改。
-### Metric
-metric的处理过程应该不用动，简单说一下
+### 3. 编码器和融合模型
 
-303行的GaiaMetric类是加载gaia数据集的，执行的是最下面的load函数，上面两个函数是被调用的。
+`model/`目录包含各种编码器和融合模型:
 
-可以看到是按日期读入metric和groundtruth的。都暂时存在自己的df里；
+- `LogEncoder`: 日志数据编码器，基于Transformer结构
+- `MetricEncoder`: 指标数据编码器，处理时间序列特征
+- `TraceEncoder`: 调用链数据编码器，处理调用关系图
+- `ConcatFusion`: 简单拼接融合模型
+- `GatedFusion`: 门控融合模型
+- `AdaFusion`: 自适应融合模型
 
-每一天的数据都有一个groundtruth.csv，这个是注入记录，有注入的时间和根因；
+## 数据处理流程
 
-然后看MetricDataset类__load_metric__函数，根据一条注入记录，去找这个时间内的metric，丢到meta_load_metric里去生成特征向量（不太确定，还得看看normalize_and_diff和rebuild函数是干什么的），拿回来的结果写到self.X中；
-load_labels函数中，将根因的分类以及根因（哪个服务实例）写到self.y中；
+1. **服务实例发现**:
+   - `process_all.py`自动扫描服务目录，发现所有服务实例文件夹
+   - 或使用配置文件中预定义的服务列表
 
-metric最后生成的特征向量就是你的save_dir下面的gaia_metric_tmp.json，这个文件有两部分：data["X"]和data["y"]（注意大小写），如果没问题的话，data["X"]的维数应该是(1099, 10, 103)，代表1099个注入记录中，10个服务实例的183维特征向量；data["Y"]则表示每一个注入记录的根因实例，从0~9分别是logservice1 logservice2 mobservice1 mobservice2 redisservice1 redisservice2 dbservice1 dbservice2 webservice1 webservice2（config中的instances）
-### Log
-这个需要分服务实例来跑，一次运行只能跑一个服务实例的，数据集形式跟metric不一样，上面有说，目前可以用脚本跑十次。后面看看怎么改。
+2. **指标数据处理**:
+   - 加载全局指标数据
+   - 通过Z-score归一化和差分处理时间序列
+   - 拆分指标数据到各个服务目录
 
-处理逻辑还是跟metric差不多，先GaiaLog类读log和groundtruth，这边由于数据集1099个groundtruth的时间窗口中的这一个服务根本没有log数据，这些groundtruth对应的特征向量我直接置0了，在366行；
+3. **服务数据处理**:
+   - 为每个服务单独处理日志和调用链数据
+   - 日志处理: 模板提取、BERT编码、特征加权
+   - 调用链处理: 延迟序列提取、统计特征计算
 
-得到特征向量则是在LogDataset类中的__add_sample__函数，都有写注释，一个ground_truth得到的768维特征向量写在self.X中，根因写在self.y中；
+4. **特征融合**:
+   - 合并所有服务的特征矩阵
+   - 提供两种融合方法:
+     - 简单拼接: 直接拼接各模态特征
+     - 编码器提取: 使用专门的编码器提取更高级表示
 
-如果你是用脚本跑的，最终生成的特征向量应该在每一个服务实例文件夹下面的gaia_log_tmp.json文件，也是有X和y，X的维数是(1099, 768)，每个服务每个注入记录的768维特征向量；y就是每个注入的根因实例；
-### Trace
-跟Log一样也是分服务实例跑，GaiaTrace里面的读入都没有什么大问题，问题是特征向量的处理方式；
+5. **结果保存**:
+   - 中间结果: 保存各模态处理后的特征
+   - 最终结果: 保存融合后的特征矩阵
 
-原本Medicine将Trace处理成特征向量，是读入trace后将A->B、B->C的调用过程拼接作为一个span进行处理；但我们现在数据集已经分服务实例了，肯定找不到父子调用trace，因此之前的那个处理逻辑完全改掉了。
+## 输入数据要求
 
-现在处理的过程在TraceDataset类里的__load__函数中，加载每个groundtruth，找到窗口内的trace数据，当做时序数据进行处理，create_time_series这个函数，目前非常丑陋，就是提出trace里面的延迟作为时间序列数据一处理，再归一化，得到一个10维向量作为特征向量，然后写到self.X里（这一坨我用AI跑的，看不懂你也丢给AI问问）。不管是向量维数还是处理方法都太简略了，这个比较麻烦，得看看要怎么改这个处理逻辑。
+### 指标数据
 
-最后得到的gaia_trace_tmp.json维数是(1099, 10)，意义跟上面类似。
+期望的列: `timestamp`, `cmdb_id`, `kpi_name`, `value`
 
-## 4. 关于拼接
-最后得到每个时间窗口的三种特征向量之后，分别是103维、768维和10维，这三个特征向量现在只是简单的首位拼在一起得到一个881维向量作为一个groundtruth的特征向量。后面要怎么合并（比如三种向量维数先同步，再相加），或者什么别的方法还要考虑。
+### 日志数据
+
+期望的列: `timestamp`, `message`
+
+### 调用链数据
+
+期望的列: `timestamp`, `st_time`, `ed_time`, `parent_id`, `cmdb_id`
+
+### 标记数据(Groundtruth)
+
+期望的列: `st_time`, `ed_time`, `failure_type`, `root_cause`
+
+## 输出文件
+
+处理后的数据保存在配置中指定的`save_dir`目录:
+
+- `{dataset}_metric_tmp.json`: 原始指标特征
+- `service/{service}/{dataset}_log_tmp.json`: 各服务日志特征
+- `service/{service}/{dataset}_trace_tmp.json`: 各服务调用链特征
+- `service/{service}/{dataset}_metric_tmp.json`: 拆分后的服务指标特征
+- `{dataset}_merged_features.json`: 合并后的特征
+- `{dataset}_concat_features.json`: 简单拼接的特征
+- `{dataset}_encoded_features.json`: 编码器提取的特征
+
+## 扩展和自定义
+
+### 添加新的数据集
+
+1. 在`config.py`中添加新的数据集配置
+2. 定义数据路径、服务列表、故障类型等参数
+
+### 自定义特征提取
+
+1. 修改相应的数据集类(`log.py`, `metric.py`, `trace.py`)
+2. 重写`load()`方法实现自定义数据加载和处理逻辑
+
+### 定制融合方法
+
+1. 在`model/fusion.py`中添加新的融合模型
+2. 修改`main.py`中的融合逻辑
+
+## 代码示例
+
+### 处理新服务的数据
+
+```python
+from main import FeatureProcessor
+from config import CONFIG_DICT
+
+# 加载配置
+config = CONFIG_DICT["gaia"].copy()
+config["service_name"] = "my_new_service"
+
+# 创建处理器
+processor = FeatureProcessor(config, "2023-01-01")
+
+# 处理服务数据
+processor.process_service("my_new_service")
+
+# 融合特征
+processor.merge_features()
+```
+
+## 常见问题
+
+1. **找不到服务目录**
+   - 确保配置中的`service_dir`路径正确
+   - 检查目录权限和文件存在性
+
+2. **处理时内存不足**
+   - 调整批处理大小
+   - 减少并行处理的工作线程数
+
+3. **特征维度不匹配**
+   - 确保所有服务都有相同的指标列表
+   - 检查日志和调用链数据的完整性
+
+## 项目开发者
+
+如果您是项目开发者，以下信息会帮助您理解和修改代码:
+
+### 关键设计决策
+
+1. **中心化配置管理**:
+   - 所有配置都集中在`config.py`
+   - 其他模块通过依赖注入接收配置
+
+2. **服务特定路径处理**:
+   - 使用`set_service_paths`方法设置服务特定路径
+   - 避免修改全局配置
+
+3. **统一数据接口**:
+   - 所有数据集类继承自`BaseDataset`
+   - 标准化的`load()`和`save_to_tmp()`方法
+
+4. **可扩展的特征融合**:
+   - 支持多种特征融合方式
+   - 编码器与融合模型分离
+
+### 主要代码流程
+
+1. **process_all.py**:
+   - 发现服务实例
+   - 按顺序处理指标、服务数据、融合特征
+
+2. **main.py**:
+   - 根据命令行参数执行不同任务
+   - 处理指标、服务数据、融合特征
+
+3. **dataset/\*.py**:
+   - 加载和预处理原始数据
+   - 提取和保存特征
+
+4. **model/\*.py**:
+   - 定义各种编码器和融合模型
+   - 提供特征提取功能
+```

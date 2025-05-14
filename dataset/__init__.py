@@ -1,22 +1,32 @@
-from .log import Aiops22Log, PlatformLog, GaiaLog
-from .metric import Aiops22Metric, PlatformMetric, GaiaMetric
-from .trace import Aiops22Trace, PlatformTrace, GaiaTrace
+from .log import UnifiedLogDataset as LogDataset
+from .metric import UnifiedMetricDataset as MetricDataset
+from .trace import UnifiedTraceDataset as TraceDataset
 
-# add your dataset here
+# 简化的数据集映射
 LOG_DATASET = {
-    "aiops22": Aiops22Log,
-    "platform": PlatformLog,
-    "gaia": GaiaLog
+    "aiops22": LogDataset,
+    "platform": LogDataset,
+    "gaia": LogDataset,
+    "ob": LogDataset,
+    "tt": LogDataset
 }
-# add your dataset here
+
 METRIC_DATASET = {
-    "aiops22": Aiops22Metric,
-    "platform": PlatformMetric,
-    "gaia": GaiaMetric
+    "aiops22": MetricDataset,
+    "platform": MetricDataset,
+    "gaia": MetricDataset,
+    "ob": MetricDataset,
+    "tt": MetricDataset
 }
-# add your dataset here
+
 TRACE_DATASET = {
-    "aiops22": Aiops22Trace,
-    "platform": PlatformTrace,
-    "gaia": GaiaTrace
+    "aiops22": TraceDataset,
+    "platform": TraceDataset,
+    "gaia": TraceDataset,
+    "ob": TraceDataset,
+    "tt": TraceDataset
 }
+
+# 直接导出统一的类，便于导入
+__all__ = ['LogDataset', 'MetricDataset', 'TraceDataset', 
+           'LOG_DATASET', 'METRIC_DATASET', 'TRACE_DATASET']

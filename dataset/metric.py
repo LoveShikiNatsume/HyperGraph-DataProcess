@@ -5,6 +5,7 @@ from multiprocessing import Pool
 import re
 import utils as U
 from .base_dataset import BaseDataset
+from datetime import datetime
 
 
 def normalize_and_diff(df, column):
@@ -53,10 +54,15 @@ def meta_load_metric(
     return metric
 
 
-class MetricDataset(BaseDataset):
+class UnifiedMetricDataset(BaseDataset):
     def __init__(self, config) -> None:
         super().__init__(config, "metric")
         self.sample_interval = config["sample_interval"]
+        
+        # 从配置中加载数据集特定参数
+        self.dates = config.get("dates", [])
+        self.anomaly_dict = config.get("anomaly_dict", {})
+        self.file_patterns = config.get("file_patterns", {})
 
         # feature
         self.kpi_num = 0
@@ -71,12 +77,14 @@ class MetricDataset(BaseDataset):
         super().save_to_tmp({"kpi_num": self.kpi_num, "kpi_list": self.kpi_list})
 
     def __get_kpi_list__(self, metric_files):
+        """获取KPI指标列表"""
         metric_df = self.__load_df__(metric_files)
         self.kpi_list = list(set(metric_df["kpi_name"].tolist()))
         self.kpi_list.sort()
         self.kpi_num = len(self.kpi_list)
 
     def __load_labels__(self, gt_df: pd.DataFrame):
+        """加载标签数据"""
         r"""
         gt_df:
             columns = ["failure_type", "root_cause(service level)"]
@@ -90,6 +98,7 @@ class MetricDataset(BaseDataset):
         self.__y__["root_cause"].extend(root_cause)
 
     def __load_metric__(self, gt_df: pd.DataFrame, metric_df: pd.DataFrame):
+        """加载指标数据"""
         r"""
         gt_df:
             columns = ["st_time(10)", "ed_time(10)", "failure_type", "root_cause"]
@@ -136,6 +145,7 @@ class MetricDataset(BaseDataset):
         return self.kpi_num
 
     def rebuild(self, metric_df):
+        """重建时序数据"""
         U.notice("Rebuild ts data")
         pool = Pool(self.num_workers)
         scheduler = tqdm(total=len(metric_df), desc="dispatch")
@@ -156,222 +166,96 @@ class MetricDataset(BaseDataset):
         scheduler.close()
         return pd.concat(dfs)
 
-
-class Aiops22Metric(MetricDataset):
-    def __init__(self, config: dict) -> None:
-        super().__init__(config)
-        self.ANOMALY_DICT = {
-            "k8s容器网络延迟": "network",
-            "k8s容器写io负载": "io",
-            "k8s容器读io负载": "io",
-            "k8s容器cpu负载": "cpu",
-            "k8s容器网络资源包重复发送": "network",
-            "k8s容器进程中止": "process",
-            "k8s容器网络丢包": "network",
-            "k8s容器内存负载": "memory",
-            "k8s容器网络资源包损坏": "network",
-        }
-
     def __load_groundtruth_df__(self, file_list):
-        groundtruth_df = self.__load_df__(file_list, is_json=True)
-        groundtruth_df = groundtruth_df.query("level != 'node'")
-        groundtruth_df.loc[:, "cmdb_id"] = groundtruth_df["cmdb_id"].apply(
-            lambda x: re.sub(r"\d?-\d", "", x)
-        )
-        groundtruth_df = groundtruth_df.rename(
-            columns={"timestamp": "st_time", "cmdb_id": "root_cause"}
-        )
+        """处理groundtruth数据，统一输出格式"""
+        if not file_list:
+            return None
+        
+        # 读取文件，是否为JSON格式根据数据集决定
+        groundtruth_df = self.__load_df__(file_list, is_json=self.dataset == "aiops22")
+        
+        # 标准化列名
+        if "anomaly_type" in groundtruth_df.columns:
+            groundtruth_df = groundtruth_df.rename(columns={"anomaly_type": "failure_type"})
+        if "instance" in groundtruth_df.columns:
+            groundtruth_df = groundtruth_df.rename(columns={"instance": "root_cause"})
+        if "cmdb_id" in groundtruth_df.columns and "root_cause" not in groundtruth_df.columns:
+            groundtruth_df = groundtruth_df.rename(columns={"cmdb_id": "root_cause"})
+                
+        # 处理时间字段
+        if "st_time" in groundtruth_df.columns and isinstance(groundtruth_df["st_time"].iloc[0], str):
+            groundtruth_df["st_time"] = groundtruth_df["st_time"].apply(
+                lambda x: datetime.strptime(x.split(".")[0], "%Y-%m-%d %H:%M:%S").timestamp()
+            )
+        
+        # 设置时间窗口
         duration = 600
         groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
-        groundtruth_df["st_time"] = groundtruth_df["st_time"] - duration
-        groundtruth_df = groundtruth_df.reset_index(drop=True)
-        groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
-            lambda x: self.ANOMALY_DICT[x]
-        )
-        return groundtruth_df.loc[
-            :, ["st_time", "ed_time", "failure_type", "root_cause"]
-        ]
+        
+        # 故障类型映射
+        if "failure_type" in groundtruth_df.columns and self.anomaly_dict:
+            groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
+                lambda x: self.anomaly_dict.get(x, x)
+            )
+        
+        return groundtruth_df.loc[:, ["st_time", "ed_time", "failure_type", "root_cause"]]
 
     def __load_metric_df__(self, file_list):
+        """处理指标数据，统一输出格式"""
+        if not file_list:
+            return None
+        
         metric_df = self.__load_df__(file_list)
-        metric_df["cmdb_id"] = metric_df["cmdb_id"].apply(lambda x: x.split(".")[1])
+        
+        # 对时间戳进行标准化处理，确保为10位整数
+        if "timestamp" in metric_df.columns:
+            metric_df["timestamp"] = metric_df["timestamp"].apply(
+                lambda x: int(x/1000) if len(str(int(x))) > 10 else int(x)
+            )
+        
+        # 重建时序数据
         metric_df = self.rebuild(metric_df)
         return metric_df.loc[:, ["timestamp", "cmdb_id", "kpi_name", "value"]]
 
     def load(self):
-        # read run_table
-        groundtruth_files = self.__get_files__(self.dataset_dir, "groundtruth-")
-        metric_files = self.__get_files__(self.dataset_dir, "kpi_container")
+        """统一加载不同数据集的指标数据"""
+        # 获取文件匹配模式
+        metric_pattern = self.file_patterns.get("metric", ["cpu", "memory", "rx", "tx"])
+        groundtruth_pattern = self.file_patterns.get("groundtruth", "groundtruth")
+        
+        # 获取文件列表
+        groundtruth_files = self.__get_files__(self.dataset_dir, groundtruth_pattern)
+        metric_files = self.__get_files__(self.dataset_dir, metric_pattern)
+        
+        # 获取KPI列表
         self.__get_kpi_list__(metric_files)
-        dates = [
-            "2022-05-01",
-            "2022-05-03",
-            "2022-05-05",
-            "2022-05-07",
-            "2022-05-09",
-        ]
-        groundtruths = self.__add_by_date__(groundtruth_files, dates)
-        metrics = self.__add_by_date__(metric_files, dates)
-
-        for index, date in enumerate(dates):
+        
+        # 按日期分组
+        groundtruths = self.__add_by_date__(groundtruth_files, self.dates)
+        metrics = self.__add_by_date__(metric_files, self.dates)
+        
+        # 逐日期处理数据
+        for index, date in enumerate(self.dates):
             U.notice(f"Loading... {date}")
-            gt_df = self.__load_groundtruth_df__(groundtruths[index])
-            metric_df = self.__load_metric_df__(metrics[index])
-            self.__load_labels__(gt_df)
-            self.__load_metric__(gt_df, metric_df)
-
-
-class PlatformMetric(MetricDataset):
-    def __init__(self, config) -> None:
-        super().__init__(config)
-        self.ANOMALY_DICT = {
-            "cpu anomaly": "cpu",
-            "http/grpc request abscence": "http/grpc",
-            "http/grpc requestdelay": "http/grpc",
-            "memory overload": "memory",
-            "network delay": "network",
-            "network loss": "network",
-            "pod anomaly": "pod_failure",
-        }
-
-    def __load_groundtruth_df__(self, file_list):
-        groundtruth_df = self.__load_df__(file_list).rename(
-            columns={
-                "故障类型": "failure_type",
-                "对应服务": "cmdb_id",
-                "起始时间戳": "st_time",
-                "截止时间戳": "ed_time",
-                "持续时间": "duration",
-            }
-        )
-
-        def meta_transfer(item):
-            if item.find("(") != -1:
-                item = eval(item)
-                item = item[0]
-            return item
-
-        groundtruth_df.loc[:, "cmdb_id"] = groundtruth_df["cmdb_id"].apply(
-            meta_transfer
-        )
-        groundtruth_df = groundtruth_df.rename(columns={"cmdb_id": "root_cause"})
-        duration = 600
-        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
-        groundtruth_df["st_time"] = groundtruth_df["st_time"] - duration
-        groundtruth_df = groundtruth_df.reset_index(drop=True)
-        groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
-            lambda x: self.ANOMALY_DICT[x]
-        )
-        return groundtruth_df.loc[
-            :, ["st_time", "ed_time", "failure_type", "root_cause"]
-        ]
-
-    def __load_metric_df__(self, file_list):
-        metric_df = self.__load_df__(file_list)
-
-        def meta_transfer(name):
-            name = name.split(".")[1]
-            if name.find("redis-cart") != -1:
-                return "redis-cart"
-            return name.split("-")[0]
-
-        metric_df["cmdb_id"] = metric_df["cmdb_id"].apply(meta_transfer)
-        metric_df = self.rebuild(metric_df)
-        return metric_df.loc[:, ["timestamp", "cmdb_id", "kpi_name", "value"]]
-
-    def load(self):
-        groundtruth_files = self.__get_files__(self.dataset_dir, "ground_truth")
-        metric_files = self.__get_files__(self.dataset_dir, "kpi_container")
-        self.__get_kpi_list__(metric_files)
-        dates = [
-            # "2024-03-20",
-            # "2024-03-21",
-            "2024-03-22",
-            "2024-03-23",
-            "2024-03-24",
-        ]
-        groundtruths = self.__add_by_date__(groundtruth_files, dates)
-        metrics = self.__add_by_date__(metric_files, dates)
-        for index, date in enumerate(dates):
-            U.notice(f"Loading... {date}")
-            gt_df = self.__load_groundtruth_df__(groundtruths[index])
-            metric_df = self.__load_metric_df__(metrics[index])
-            self.__load_labels__(gt_df)
-            self.__load_metric__(gt_df, metric_df)
-
-
-class GaiaMetric(MetricDataset):
-    def __init__(self, config: dict) -> None:
-        super().__init__(config)
-        self.ANOMALY_DICT = {
-            "[memory_anomalies]": "memory",
-            "[normal memory freed label]": "memory",
-            "[access permission denied exception]": "access",
-            "[login failure]": "login",
-            "[file moving program]": "file",
-        }
-
-    def __load_groundtruth_df__(self, file_list):
-        groundtruth_df = self.__load_df__(file_list).rename(
-            columns={
-                "anomaly_type": "failure_type",
-            }
-        )
-
-        groundtruth_df = groundtruth_df.rename(columns={"instance": "root_cause"})
-        duration = 600
-        from datetime import datetime
-
-        groundtruth_df["st_time"] = groundtruth_df["st_time"].apply(
-            lambda x: datetime.strptime(
-                x.split(".")[0], "%Y-%m-%d %H:%M:%S"
-            ).timestamp()
-        )
-        # groundtruth的处理逻辑，注入故障之前多观察一个时间周期。
-        # 故障发生时间点，往前推duration秒，作为起始时间点。
-        groundtruth_df["ed_time"] = groundtruth_df["st_time"] + duration
-        #不论是11s还是600s,统一时间窗口为600s
-        # groundtruth_df["st_time"] = groundtruth_df["st_time"] - duration
-        groundtruth_df = groundtruth_df.reset_index(drop=True)
-        groundtruth_df.loc[:, "failure_type"] = groundtruth_df["failure_type"].apply(
-            lambda x: self.ANOMALY_DICT[x]
-        )
-        return groundtruth_df.loc[
-            :, ["st_time", "ed_time", "failure_type", "root_cause"]
-        ]
-
-    def __load_metric_df__(self, file_list):
-        metric_df = self.__load_df__(file_list)
-        metric_df["cmdb_id"] = metric_df["cmdb_id"].apply(lambda x: x.split(".")[-1])
-
-        def meta_transfer(x):
-            if len(str(int(x))) != 10:
-                x = int(x / 1000)
-            return x
-
-        metric_df["timestamp"] = metric_df["timestamp"].apply(meta_transfer)
-        metric_df = self.rebuild(metric_df)
-        return metric_df.loc[:, ["timestamp", "cmdb_id", "kpi_name", "value"]]
-
-    def load(self):
-        # read run_table
-        groundtruth_files = self.__get_files__(self.dataset_dir, "groundtruth.csv")
-        metric_files = self.__get_files__(self.dataset_dir, "docker_")
-        self.__get_kpi_list__(metric_files)
-        dates = ["2021-07-04", "2021-07-05", "2021-07-06", "2021-07-07", "2021-07-08", "2021-07-09", "2021-07-10", "2021-07-11", "2021-07-12", "2021-07-13", "2021-07-14", "2021-07-15", "2021-07-16", "2021-07-17", "2021-07-18", "2021-07-20", "2021-07-21", "2021-07-22", "2021-07-23", "2021-07-24", "2021-07-25", "2021-07-26", "2021-07-27", "2021-07-28", "2021-07-29", "2021-07-30", "2021-07-31"]
-        groundtruths = self.__add_by_date__(groundtruth_files, dates)
-        metrics = self.__add_by_date__(metric_files, dates)
-        for index, date in enumerate(dates):
-            U.notice(f"Loading... {date}")
-            if groundtruths[index]:
-                gt_df = self.__load_groundtruth_df__(groundtruths[index])
-            else:
+            
+            # 检查groundtruth文件是否存在
+            if not groundtruths[index]:
                 U.notice(f"Skipping {date}: groundtruth_df is empty.")
                 continue
-            if metrics[index]:
-                metric_df = self.__load_metric_df__(metrics[index])
-            else:
+            
+            # 加载groundtruth
+            gt_df = self.__load_groundtruth_df__(groundtruths[index])
+            if gt_df is None or gt_df.empty:
+                continue
+            
+            # 检查指标文件是否存在
+            if not metrics[index]:
                 U.notice(f"Skipping {date}: metric_df is empty.")
                 continue
+            
+            # 加载指标
+            metric_df = self.__load_metric_df__(metrics[index])
+            
+            # 处理数据
             self.__load_labels__(gt_df)
             self.__load_metric__(gt_df, metric_df)
